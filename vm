@@ -1,0 +1,676 @@
+#!/bin/bash
+# Run Linux VMs under Tart that host Raft Computer, Claude Code and the GitHub CLI.
+# One Mac can run several independent instances. See README.md or `./vm help`.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+STATE_DIR="$ROOT/.state"
+INSTANCES_DIR="$ROOT/instances"
+mkdir -p "$STATE_DIR" "$INSTANCES_DIR" "$ROOT/logs"
+
+TART="$ROOT/bin/tart"
+[ -x "$TART" ] || TART="$(command -v tart || true)"
+
+say() { printf '==> %s\n' "$*"; }
+warn() { printf 'warning: %s\n' "$*" >&2; }
+die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+need_tart() { [ -n "$TART" ] || die "tart not found. Run ./vm install-tart or brew install cirruslabs/cli/tart"; }
+host_label() { scutil --get LocalHostName 2>/dev/null || hostname -s; }
+host_mem_mb() { echo $(( $(sysctl -n hw.memsize) / 1048576 )); }
+
+# Run a command with a hard timeout (macOS has no timeout(1)).
+tmo() { local s=$1; shift; perl -e 'alarm shift; exec @ARGV' "$s" "$@"; }
+
+# ---- instances --------------------------------------------------------------
+# Each instance is one file, instances/<name>.env, layered over defaults.env.
+instance_names() {
+  local f
+  for f in "$INSTANCES_DIR"/*.env; do
+    [ -e "$f" ] || continue
+    f="${f##*/}"; f="${f%.env}"
+    [ "$f" = example ] && continue
+    printf '%s\n' "$f"
+  done
+}
+
+# Older checkouts had one config.env. Turn it into the first instance, and keep
+# the settings that an already-installed launchd job depends on.
+migrate_legacy() {
+  [ -f "$ROOT/config.env" ] && [ -z "$(instance_names)" ] || return 0
+  local name
+  name="$( . "$ROOT/config.env"; echo "${VM_NAME:-}" )"
+  [ -n "$name" ] || return 0
+  cp "$ROOT/config.env" "$INSTANCES_DIR/$name.env"
+  cat >> "$INSTANCES_DIR/$name.env" <<EOF
+
+# Migrated from config.env. These two lines keep the launchd job that was
+# installed before multi-instance support working. After running
+# \`./vm -n $name autostart on\` once you may delete them.
+STOPPED_FLAG="\$ROOT/.state/stopped"
+HOST_LOG="\$ROOT/logs/vm.log"
+EOF
+  mv "$ROOT/config.env" "$ROOT/config.env.migrated"
+  printf '%s' "$name" > "$STATE_DIR/default"
+  warn "migrated config.env to instances/$name.env (default instance: $name)"
+}
+
+resolve_instance() {
+  local name=${INSTANCE:-} names count
+  names="$(instance_names)"
+  if [ -z "$name" ] && [ -s "$STATE_DIR/default" ]; then name="$(cat "$STATE_DIR/default")"; fi
+  if [ -z "$name" ]; then
+    count="$(printf '%s\n' "$names" | grep -c . || true)"
+    case "$count" in
+      0) die "no instance yet. Create one: ./vm new <name> --raft /<server>" ;;
+      1) name="$names" ;;
+      *) die "several instances ($(echo $names)): pass -n NAME or run ./vm use NAME" ;;
+    esac
+  fi
+  [ -f "$INSTANCES_DIR/$name.env" ] && [ "$name" != example ] \
+    || die "no instance '$name'. Existing: $(echo $names). Create: ./vm new $name"
+  printf '%s' "$name"
+}
+
+# Load defaults.env and the chosen instance into shell variables.
+load_instance() {
+  NAME="$(resolve_instance)"
+  INSTANCE_FILE="$INSTANCES_DIR/$NAME.env"
+  # shellcheck disable=SC1090
+  . "$ROOT/defaults.env"
+  # shellcheck disable=SC1090
+  . "$INSTANCE_FILE"
+  VM_NAME="${VM_NAME:-$NAME}"
+  CPUS="${CPUS:-$(sysctl -n hw.logicalcpu)}"
+  MEMORY_MB="${MEMORY_MB:-$(( $(host_mem_mb) / 2 ))}"
+  LAUNCHD_LABEL="${LAUNCHD_LABEL:-com.tartvm.$NAME}"
+  STOPPED_FLAG="${STOPPED_FLAG:-$STATE_DIR/$NAME.stopped}"
+  HOST_LOG="${HOST_LOG:-$ROOT/logs/$NAME.log}"
+  RAFT_COMPUTER_NAME="${RAFT_COMPUTER_NAME:-$(host_label)-$NAME}"
+  GUEST_HOSTNAME="${GUEST_HOSTNAME:-$NAME}"
+  PLIST="$HOME/Library/LaunchAgents/$LAUNCHD_LABEL.plist"
+  LAUNCHD_DOMAIN="gui/$(id -u)"
+}
+
+# Set KEY=VALUE in the current instance file (replace or append).
+set_conf() {
+  if grep -q "^$1=" "$INSTANCE_FILE"; then sed -i '' "s|^$1=.*|$1=$2|" "$INSTANCE_FILE"
+  else printf '%s=%s\n' "$1" "$2" >> "$INSTANCE_FILE"; fi
+}
+
+# ---- VM state ---------------------------------------------------------------
+vm_row() { "$TART" list --source local 2>/dev/null | awk -v n="$VM_NAME" '$2==n'; }
+vm_exists() { [ -n "$(vm_row)" ]; }
+vm_running() { [ "$(vm_row | awk '{print $NF}')" = "running" ]; }
+vm_field() { "$TART" get "$VM_NAME" | awk -v c="$1" 'NR==2{print $c}'; }  # 2=CPU 3=Memory 4=Disk
+
+# ---- guest access -----------------------------------------------------------
+# `tart exec` goes through the guest agent, so it needs no SSH, IP or password.
+# gl runs a snippet in a login shell (PATH, ~/.profile). Extra args become $1..
+# and a terminal is attached automatically when this one is interactive.
+gl() {
+  local script=$1; shift
+  local flags=()
+  if [ -t 0 ] && [ -t 1 ]; then flags=(-i -t); fi
+  "$TART" exec ${flags[@]+"${flags[@]}"} "$VM_NAME" bash -lc "$script" _ ${@+"$@"}
+}
+
+# Copy a small file into the guest as a base64 argument and verify its checksum.
+# (Piping through `tart exec -i` once produced an empty file, so it is not used for files.)
+push_file() {
+  local src=$1 dst=$2 b64 want got
+  b64="$(base64 < "$src" | tr -d '\n')"
+  "$TART" exec "$VM_NAME" bash -c 'printf %s "$1" | base64 -d > "$2"' _ "$b64" "$dst"
+  want="$(shasum -a 256 < "$src" | cut -d" " -f1)"
+  got="$("$TART" exec "$VM_NAME" sha256sum "$dst" | cut -d" " -f1)"
+  [ "$want" = "$got" ] || die "copy of $src to the guest failed (checksum mismatch)"
+}
+
+wait_ready() {
+  say "waiting for the guest agent"
+  local i
+  for i in $(seq 1 90); do
+    if tmo 6 "$TART" exec "$VM_NAME" true >/dev/null 2>&1; then return 0; fi
+    sleep 2
+  done
+  die "guest did not become ready; see $HOST_LOG"
+}
+
+require_running() {
+  vm_exists || die "VM '$VM_NAME' does not exist. Run ./vm -n $NAME init"
+  vm_running || die "VM is not running. Run ./vm -n $NAME start"
+}
+
+# ---- lifecycle --------------------------------------------------------------
+launchd_loaded() { launchctl print "$LAUNCHD_DOMAIN/$LAUNCHD_LABEL" >/dev/null 2>&1; }
+
+run_args() { printf '%s\n' run --no-graphics "--root-disk-opts=$DISK_OPTS" "$VM_NAME"; }
+
+start_vm() {
+  need_tart; vm_exists || die "VM '$VM_NAME' does not exist. Run ./vm -n $NAME init"
+  rm -f "$STOPPED_FLAG"
+  if ! vm_running; then
+    say "starting $VM_NAME"
+    if launchd_loaded; then
+      launchctl kickstart "$LAUNCHD_DOMAIN/$LAUNCHD_LABEL"
+    else
+      nohup "$TART" run --no-graphics --root-disk-opts="$DISK_OPTS" "$VM_NAME" >>"$HOST_LOG" 2>&1 &
+      disown
+    fi
+  fi
+  wait_ready
+}
+
+# `tart stop` is a hard power-off, so ask the guest to shut down by itself first
+# and only force it if it has not finished within ~60 seconds.
+graceful_stop() {
+  vm_running || return 0
+  tmo 15 "$TART" exec "$VM_NAME" sudo systemctl poweroff >/dev/null 2>&1 || true
+  local i
+  for i in $(seq 1 60); do vm_running || return 0; sleep 1; done
+  echo "guest did not power off in time; forcing" >&2
+  "$TART" stop "$VM_NAME" --timeout 5 || true
+}
+
+stop_vm() {
+  need_tart
+  touch "$STOPPED_FLAG"   # tells launchd not to restart it
+  if vm_running; then say "stopping $VM_NAME"; graceful_stop; fi
+}
+
+# Change a Tart setting: stop the VM if needed, apply, start it again.
+reconfigure() {
+  need_tart; vm_exists || die "VM '$VM_NAME' does not exist"
+  local was_running=0
+  if vm_running; then was_running=1; stop_vm; fi
+  "$TART" set "$VM_NAME" "$@"
+  if [ "$was_running" = 1 ]; then start_vm; fi
+}
+
+# Warn when the configured instances cannot all fit in this Mac's memory.
+check_capacity() {
+  local host total=0 n m
+  host="$(host_mem_mb)"
+  for n in $(instance_names); do
+    m="$( ( INSTANCE=$n; load_instance; echo "$MEMORY_MB" ) )"
+    total=$(( total + m ))
+  done
+  if [ "$total" -gt $(( host * 85 / 100 )) ]; then
+    warn "configured instances add up to ${total}MB of ${host}MB host memory. Guest memory is not returned to macOS, so running them all at once may swap. Lower MEMORY_MB or run fewer VMs."
+  fi
+}
+
+# ---- commands without an instance -------------------------------------------
+cmd_install_tart() {
+  if [ -x "$ROOT/bin/tart" ] && [ "${1:-}" != "--force" ]; then
+    say "already installed: $("$ROOT/bin/tart" --version)"; return
+  fi
+  local tmp; tmp="$(mktemp -d)"
+  curl -fsSL -o "$tmp/tart.tar.gz" https://github.com/cirruslabs/tart/releases/latest/download/tart.tar.gz
+  tar -xzf "$tmp/tart.tar.gz" -C "$tmp"
+  mkdir -p "$ROOT/bin"
+  rm -rf "$ROOT/bin/tart.app"; cp -R "$tmp/tart.app" "$ROOT/bin/"
+  cp "$tmp/LICENSE" "$ROOT/bin/TART-LICENSE"
+  ln -sf tart.app/Contents/MacOS/tart "$ROOT/bin/tart"
+  xattr -dr com.apple.quarantine "$ROOT/bin/tart.app" 2>/dev/null || true
+  rm -rf "$tmp"
+  say "installed tart $("$ROOT/bin/tart" --version)"
+}
+
+cmd_doctor() {
+  local ok=1 ver arch free_gb
+  arch="$(uname -m)"; ver="$(sw_vers -productVersion)"
+  if [ "$arch" = arm64 ]; then echo "ok    Apple Silicon ($arch)"; else echo "FAIL  needs Apple Silicon, found $arch"; ok=0; fi
+  if [ "${ver%%.*}" -ge 13 ]; then echo "ok    macOS $ver"; else echo "FAIL  needs macOS 13 or newer, found $ver"; ok=0; fi
+  if [ -n "$TART" ]; then echo "ok    tart $("$TART" --version)"; else echo "FAIL  tart missing: ./vm install-tart"; ok=0; fi
+  free_gb=$(( $(df -k "$HOME" | awk 'NR==2{print $4}') / 1048576 ))
+  echo "info  ${free_gb}GB free on this volume (VM disks are sparse and grow as the guest writes)"
+  echo "info  host memory $(host_mem_mb)MB, $(sysctl -n hw.logicalcpu) logical CPUs"
+  [ "$(stat -f %Su /dev/console)" = "$(id -un)" ] \
+    && echo "ok    $(id -un) is logged in at the desktop (needed for autostart)" \
+    || echo "warn  $(id -un) is not the console user; autostart and VMs need a logged-in desktop session"
+  check_capacity
+  [ "$ok" = 1 ] || exit 1
+}
+
+cmd_new() {
+  local name=${1:-}; [ -n "$name" ] || die "usage: ./vm new <name> [--raft /server] [--cpu N] [--memory MB] [--disk GB] [--image IMAGE]"
+  shift
+  [[ $name =~ ^[a-z0-9][a-z0-9-]{0,30}$ ]] || die "name must be lowercase letters, digits and dashes (it becomes the guest hostname)"
+  [ "$name" != example ] || die "'example' is reserved"
+  local file="$INSTANCES_DIR/$name.env"
+  [ ! -e "$file" ] || die "instance '$name' already exists ($file)"
+  local raft="" cpu="" mem="" disk="" image=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --raft) raft=${2:?}; shift 2 ;;
+      --cpu) cpu=${2:?}; shift 2 ;;
+      --memory) mem=${2:?}; shift 2 ;;
+      --disk) disk=${2:?}; shift 2 ;;
+      --image) image=${2:?}; shift 2 ;;
+      *) die "unknown option $1" ;;
+    esac
+  done
+  {
+    echo "# Instance '$name' (created $(date +%Y-%m-%d)). See example.env for every option."
+    echo "RAFT_SERVER=${raft}"
+    [ -z "$cpu" ] || echo "CPUS=$cpu"
+    [ -z "$mem" ] || echo "MEMORY_MB=$mem"
+    [ -z "$disk" ] || echo "DISK_GB=$disk"
+    [ -z "$image" ] || echo "BASE_IMAGE=$image"
+  } > "$file"
+  [ -s "$STATE_DIR/default" ] || printf '%s' "$name" > "$STATE_DIR/default"
+  say "created $file"
+  check_capacity
+  echo "Next: ./vm -n $name init"
+}
+
+cmd_use() {
+  local name=${1:-}; [ -n "$name" ] || die "usage: ./vm use <name>"
+  [ -f "$INSTANCES_DIR/$name.env" ] || die "no instance '$name'. Existing: $(echo $(instance_names))"
+  printf '%s' "$name" > "$STATE_DIR/default"
+  say "default instance is now $name"
+}
+
+cmd_list() {
+  local n def=""
+  [ -s "$STATE_DIR/default" ] && def="$(cat "$STATE_DIR/default")"
+  [ -n "$(instance_names)" ] || { echo "no instances. Create one: ./vm new <name> --raft /<server>"; return; }
+  printf '%-16s %-11s %4s %8s %6s  %-9s %s\n' NAME STATE CPU MEMORY DISK AUTOSTART RAFT
+  for n in $(instance_names); do
+    ( INSTANCE=$n; load_instance
+      st="not created"; cpu=$CPUS; mem=$MEMORY_MB; disk=$DISK_GB
+      if vm_exists; then
+        st="$(vm_row | awk '{print $NF}')"; cpu="$(vm_field 2)"; mem="$(vm_field 3)"; disk="$(vm_field 4)"
+      fi
+      as=off; launchd_loaded && as=on
+      label="$n"; [ "$n" = "$def" ] && label="$n*"
+      printf '%-16s %-11s %4s %7sM %5sG  %-9s %s\n' "$label" "$st" "$cpu" "$mem" "$disk" "$as" "${RAFT_SERVER:--}" )
+  done
+  [ -z "$def" ] || echo "(* = default instance; change with ./vm use <name>)"
+}
+
+# Copy this setup to another Mac and install Tart there. VM data and Tart's
+# binary stay per machine; instance files already on the target are kept.
+cmd_deploy() {
+  local target=${1:-}; [ -n "$target" ] || die "usage: ./vm deploy user@host [remote-dir]"
+  local dir=${2:-$(basename "$ROOT")}
+  say "copying scripts to $target:$dir"
+  ssh "$target" "mkdir -p '$dir/instances'"
+  rsync -a --exclude 'bin/' --exclude '.state/' --exclude 'logs/' --exclude '.git/' \
+    --exclude '.DS_Store' --exclude 'instances/' --exclude 'config.env*' "$ROOT/" "$target:$dir/"
+  rsync -a --ignore-existing --exclude 'example.env' "$INSTANCES_DIR/" "$target:$dir/instances/"
+  rsync -a "$INSTANCES_DIR/example.env" "$target:$dir/instances/example.env"
+  ssh "$target" "cd '$dir' && ./vm install-tart"
+  cat <<EOF
+
+Deployed. On $target, in ~/$dir:
+  ./vm list                  # instances copied from here (create more with ./vm new)
+  ./vm -n <name> init        # clone, configure, provision (about 10 minutes)
+  ./vm -n <name> raft-setup  # each VM is its own Raft computer: approve it in the browser
+  ./vm -n <name> claude-login
+  ./vm -n <name> github-login
+  ./vm -n <name> autostart on
+EOF
+}
+
+# ---- commands for one instance ----------------------------------------------
+provision_guest() {   # $1 = guest hostname to set (only for a fresh clone)
+  require_running
+  say "provisioning guest (idempotent)"
+  push_file "$ROOT/guest/raft-computer.service" /tmp/raft-computer.service
+  push_file "$ROOT/guest/provision.sh" /tmp/raft-provision.sh
+  "$TART" exec "$VM_NAME" env GUEST_HOSTNAME="${1:-}" bash /tmp/raft-provision.sh
+}
+
+cmd_init() {
+  need_tart
+  local fresh=""
+  if vm_exists; then
+    say "VM '$VM_NAME' already exists; skipping clone"
+  else
+    check_capacity
+    say "cloning $BASE_IMAGE (the first pull is a few GB; later clones reuse it)"
+    "$TART" clone "$BASE_IMAGE" "$VM_NAME"
+    say "configuring: cpu=$CPUS memory=${MEMORY_MB}MB disk=${DISK_GB}GB"
+    "$TART" set "$VM_NAME" --cpu "$CPUS" --memory "$MEMORY_MB" --disk-size "$DISK_GB"
+    fresh=1
+  fi
+  start_vm
+  provision_guest "${fresh:+$GUEST_HOSTNAME}"
+  cat <<EOF
+
+VM '$NAME' is ready. Next, authenticate (details in README.md):
+  ./vm -n $NAME raft-setup      # approve this computer in your browser, then it starts
+  ./vm -n $NAME claude-login    # or: ./vm -n $NAME claude-key
+  ./vm -n $NAME github-login
+  ./vm -n $NAME autostart on    # start the VM when you log in
+EOF
+}
+
+cmd_status() {
+  need_tart
+  vm_exists || { echo "VM '$VM_NAME' (instance $NAME) does not exist. Run ./vm -n $NAME init"; return; }
+  echo "Instance:   $NAME (VM $VM_NAME, $(vm_row | awk '{print $NF}'))"
+  echo "Configured: cpu=$(vm_field 2) memory=$(vm_field 3)MB disk=$(vm_field 4)GB"
+  if launchd_loaded; then echo "Autostart:  on ($LAUNCHD_LABEL)"; else echo "Autostart:  off"; fi
+  vm_running || return 0
+  echo "IP:         $("$TART" ip "$VM_NAME" 2>/dev/null || echo '-')"
+  echo "--- guest"
+  gl 'echo "host:  $(hostname)"; echo "cpus:  $(nproc)"; echo "mem:   $(free -h | awk "/Mem:/{print \$2\" total, \"\$3\" used\"}")"; df -h / | awk "NR==2{print \"disk:  \"\$2\" total, \"\$3\" used, \"\$4\" free\"}"'
+  echo "--- raft-computer"
+  gl 'systemctl --user is-enabled raft-computer 2>&1 | sed "s/^/unit enabled: /"; systemctl --user is-active raft-computer 2>&1 | sed "s/^/unit active:  /"; raft-computer status 2>&1 | sed -n "2,12p"' || true
+  echo "--- claude"
+  gl 'claude auth status 2>&1 | head -8; [ -s ~/.config/raft-vm/env ] && echo "env file keys: $(cut -d= -f1 ~/.config/raft-vm/env | tr "\n" " ")"' || true
+  echo "--- github"
+  gl 'gh auth status 2>&1 | head -6' || true
+}
+
+cmd_raft_setup() {
+  require_running
+  [ -n "${RAFT_SERVER:-}" ] || die "RAFT_SERVER is empty. Set it in $INSTANCE_FILE (for example RAFT_SERVER=/myserver)"
+  say "connecting to Raft server $RAFT_SERVER as '$RAFT_COMPUTER_NAME' (follow the device-code prompt)"
+  gl 'raft-computer setup "$1" --name "$2" --no-start' "$RAFT_SERVER" "$RAFT_COMPUTER_NAME"
+  say "enabling the background service"
+  gl 'systemctl --user enable --now raft-computer && sleep 4 && systemctl --user is-active raft-computer && raft-computer status'
+}
+
+cmd_raft_upgrade() {
+  require_running
+  gl 'systemctl --user stop raft-computer; raft-computer upgrade -y; rc=$?; systemctl --user start raft-computer; sleep 3; raft-computer --version; systemctl --user is-active raft-computer; exit $rc'
+}
+
+cmd_raft_logs() {
+  require_running
+  if [ "${1:-}" = "-f" ]; then gl 'journalctl --user -u raft-computer -f --no-pager'
+  else gl 'journalctl --user -u raft-computer -n "${1:-150}" --no-pager' "${1:-150}"; fi
+}
+
+cmd_claude_login() {
+  require_running
+  say "starting Claude sign-in; open the URL it prints, then paste the code back here"
+  gl 'claude auth login'
+  gl 'claude auth status'
+  say "restarting Raft Computer so agents see the new login"
+  gl 'systemctl --user is-enabled raft-computer >/dev/null 2>&1 && systemctl --user restart raft-computer || true'
+}
+
+cmd_claude_key() {
+  require_running
+  local name val choice
+  if [ "${1:-}" = "clear" ]; then
+    gl ': > ~/.config/raft-vm/env; systemctl --user is-enabled raft-computer >/dev/null 2>&1 && systemctl --user restart raft-computer || true'
+    say "cleared stored Claude credentials"; return
+  fi
+  echo "1) ANTHROPIC_API_KEY        (API billing)"
+  echo "2) CLAUDE_CODE_OAUTH_TOKEN  (subscription; create with 'claude setup-token')"
+  read -r -p "Choose [1/2]: " choice
+  case "$choice" in 1) name=ANTHROPIC_API_KEY ;; 2) name=CLAUDE_CODE_OAUTH_TOKEN ;; *) die "choose 1 or 2" ;; esac
+  read -r -s -p "Paste $name (hidden): " val; echo
+  [ -n "$val" ] || die "empty value"
+  case "$val" in *"'"*|*$'\n'*) die "value contains a quote or newline" ;; esac
+  # The secret travels over stdin, never on a command line.
+  printf '%s=%s\n' "$name" "'$val'" | "$TART" exec -i "$VM_NAME" bash -c '
+    set -e
+    f="$HOME/.config/raft-vm/env"; mkdir -p "$(dirname "$f")"; touch "$f"; chmod 600 "$f"
+    IFS= read -r line; k="${line%%=*}"
+    { grep -v "^$k=" "$f" || true; printf "%s\n" "$line"; } > "$f.new"
+    mv "$f.new" "$f"; chmod 600 "$f"'
+  # stdin forwarding can drop data, so confirm the stored value has the right length.
+  local stored
+  stored="$("$TART" exec "$VM_NAME" bash -c 'grep "^$1=" "$HOME/.config/raft-vm/env" | cut -d= -f2- | tr -d "\n" | wc -c' _ "$name" | tr -d " ")"
+  [ "$stored" = "$(( ${#val} + 2 ))" ] || die "storing $name failed (length mismatch); run ./vm claude-key clear and retry"
+  say "stored $name in the guest (~/.config/raft-vm/env, mode 600)"
+  gl 'systemctl --user is-enabled raft-computer >/dev/null 2>&1 && systemctl --user restart raft-computer || true'
+}
+
+# Wire git to gh's credentials and fill in a commit identity if none is set.
+github_finish() {
+  gl 'gh auth setup-git --hostname github.com
+      if [ -z "$(git config --global user.name)" ]; then
+        git config --global user.name "$(gh api user --jq ".name // .login")"
+      fi
+      if [ -z "$(git config --global user.email)" ]; then
+        git config --global user.email "$(gh api user --jq ".email // (.id|tostring) + \"+\" + .login + \"@users.noreply.github.com\"")"
+      fi
+      gh auth status
+      echo "git identity: $(git config --global user.name) <$(git config --global user.email)>"'
+}
+
+cmd_github_login() {
+  require_running
+  say "starting GitHub sign-in: copy the one-time code, open https://github.com/login/device, approve"
+  gl 'gh auth login --hostname github.com --git-protocol https --web --scopes "repo,read:org,workflow"'
+  github_finish
+}
+
+cmd_github_token() {
+  require_running
+  local val
+  read -r -s -p "Paste a GitHub personal access token (hidden): " val; echo
+  [ -n "$val" ] || die "empty value"
+  # stdin carries the secret; `gh auth login` itself validates it against GitHub.
+  printf '%s\n' "$val" | "$TART" exec -i "$VM_NAME" bash -lc 'gh auth login --hostname github.com --git-protocol https --with-token' \
+    || die "GitHub rejected the token"
+  github_finish
+}
+
+cmd_set_disk() {
+  local want=${1:-}; [ -n "$want" ] || die "usage: ./vm set-disk <GB>"
+  need_tart; vm_exists || die "VM does not exist"
+  local cur; cur="$(vm_field 4)"
+  [ "$want" -gt "$cur" ] || die "disk is already ${cur}GB; it can only grow"
+  reconfigure --disk-size "$want"
+  set_conf DISK_GB "$want"
+  say "disk is now ${want}GB; the guest grows its root partition on boot"
+  gl 'df -h / | tail -1'
+}
+
+cmd_set_cpu() {
+  local want=${1:-$(sysctl -n hw.logicalcpu)}
+  reconfigure --cpu "$want"
+  set_conf CPUS "$want"
+  say "cpu=$want"
+}
+
+cmd_set_mem() {
+  local want=${1:-}; [ -n "$want" ] || die "usage: ./vm set-mem <MB>"
+  reconfigure --memory "$want"
+  set_conf MEMORY_MB "$want"
+  say "memory=${want}MB"
+  check_capacity
+}
+
+cmd_autostart() {
+  local n
+  case "${1:-}" in
+    on)
+      need_tart; vm_exists || die "run ./vm -n $NAME init first"
+      mkdir -p "$HOME/Library/LaunchAgents"
+      cat > "$PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$LAUNCHD_LABEL</string>
+  <key>ProgramArguments</key>
+  <array><string>$ROOT/vm</string><string>-n</string><string>$NAME</string><string>run-fg</string></array>
+  <key>EnvironmentVariables</key>
+  <dict><key>PATH</key><string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string></dict>
+  <key>RunAtLoad</key><true/>
+  <!-- Restart after crashes, but not after ./vm stop (which creates the flag file). -->
+  <key>KeepAlive</key>
+  <dict><key>PathState</key><dict><key>$STOPPED_FLAG</key><false/></dict></dict>
+  <key>ThrottleInterval</key><integer>30</integer>
+  <key>ExitTimeOut</key><integer>90</integer>
+  <key>ProcessType</key><string>Interactive</string>
+  <key>StandardOutPath</key><string>$HOST_LOG</string>
+  <key>StandardErrorPath</key><string>$HOST_LOG</string>
+</dict>
+</plist>
+EOF
+      launchctl bootout "$LAUNCHD_DOMAIN/$LAUNCHD_LABEL" 2>/dev/null || true
+      n=0
+      while launchd_loaded && [ $n -lt 20 ]; do sleep 0.5; n=$((n+1)); done
+      launchctl bootstrap "$LAUNCHD_DOMAIN" "$PLIST"
+      say "autostart on: '$NAME' starts at every login (launchd agent $LAUNCHD_LABEL)"
+      ;;
+    off)
+      launchctl bootout "$LAUNCHD_DOMAIN/$LAUNCHD_LABEL" 2>/dev/null || true
+      rm -f "$PLIST"
+      say "autostart off (a running VM keeps running until ./vm stop)"
+      ;;
+    *) if launchd_loaded; then echo "autostart: on"; else echo "autostart: off"; fi ;;
+  esac
+}
+
+# Entry point of the launchd job: own the `tart run` process in the foreground.
+cmd_run_fg() {
+  need_tart
+  # A stop flag newer than the last boot means "keep it off", even if launchd
+  # restarts this job for some other reason. A flag left from before a reboot is stale.
+  if [ -e "$STOPPED_FLAG" ]; then
+    local boot flagtime
+    boot="$(sysctl -n kern.boottime | sed -E 's/^{ sec = ([0-9]+),.*/\1/')"
+    flagtime="$(stat -f %m "$STOPPED_FLAG")"
+    if [ "$flagtime" -ge "$boot" ]; then exit 0; fi
+    rm -f "$STOPPED_FLAG"
+  fi
+  if vm_running; then   # started some other way; just wait for it to end
+    while vm_running; do sleep 30; done; exit 0
+  fi
+  "$TART" run --no-graphics --root-disk-opts="$DISK_OPTS" "$VM_NAME" &
+  local pid=$!
+  # launchd sends SIGTERM at logout/shutdown: power the guest off cleanly first.
+  trap graceful_stop TERM INT HUP
+  wait "$pid" || true
+  while kill -0 "$pid" 2>/dev/null; do wait "$pid" || true; done
+  exit 0
+}
+
+cmd_destroy() {
+  need_tart
+  local purge=""; [ "${1:-}" = "--purge" ] && purge=1
+  vm_exists || die "VM does not exist"
+  echo "This permanently deletes VM '$VM_NAME' and everything on its disk."
+  [ -z "$purge" ] || echo "--purge also deletes $INSTANCE_FILE."
+  read -r -p "Type the instance name to confirm: " ans
+  [ "$ans" = "$NAME" ] || die "cancelled"
+  cmd_autostart off; stop_vm || true
+  "$TART" delete "$VM_NAME"
+  if [ -n "$purge" ]; then
+    rm -f "$INSTANCE_FILE" "$STOPPED_FLAG"
+    [ "$(cat "$STATE_DIR/default" 2>/dev/null)" = "$NAME" ] && rm -f "$STATE_DIR/default"
+  fi
+  say "deleted"
+}
+
+usage() {
+  cat <<'EOF'
+Usage: ./vm [-n NAME] <command>
+
+One Mac can run several VMs ("instances"). Pick one with -n NAME, the VM
+environment variable, or ./vm use NAME. With a single instance it is automatic.
+-n all works with: status start stop restart provision autostart raft-upgrade.
+
+Setup
+  install-tart [--force]   download Tart into ./bin
+  doctor                   check this Mac and the memory budget
+  new <name> [--raft /server] [--cpu N] [--memory MB] [--disk GB] [--image IMG]
+  list                     all instances and their state
+  use <name>               set the default instance
+  deploy user@host         copy this setup to another Mac and install Tart there
+
+Lifecycle (one instance)
+  init                 create the VM, set cpu/mem/disk, provision
+  start | stop | restart
+  status               VM, resources, Raft Computer, Claude and GitHub state
+  shell                login shell in the guest (also: ./vm run <command...>)
+  provision            re-run guest provisioning (safe to repeat)
+  destroy [--purge]    delete the VM and its disk (--purge: and its instance file)
+
+Raft Computer
+  raft-setup           connect to RAFT_SERVER and enable the service
+  raft <args...>       run raft-computer in the guest (status, doctor, attach, ...)
+  raft-upgrade         stop, upgrade, start
+  raft-logs [-f|N]     service logs
+
+Claude Code
+  claude-login         sign in with a Claude account (browser URL + pasted code)
+  claude-key [clear]   store ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN in the guest
+  claude <args...>     run claude in the guest
+
+GitHub
+  github-login         sign in with a device code (browser), set up git credentials
+  github-token         sign in with a personal access token instead
+  gh <args...>         run the GitHub CLI in the guest
+
+Resources and boot
+  set-disk <GB>        grow the virtual disk (never shrinks)
+  set-cpu [N]          default: all host cores
+  set-mem <MB>
+  autostart on|off     start the VM at login via launchd
+EOF
+}
+
+# ---- entry point ------------------------------------------------------------
+INSTANCE="${VM:-}"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -n|--name) INSTANCE="${2:-}"; [ -n "$INSTANCE" ] || die "-n needs a name"; shift 2 ;;
+    *) break ;;
+  esac
+done
+cmd="${1:-help}"; [ $# -gt 0 ] && shift
+
+migrate_legacy
+
+case "$cmd" in
+  help|-h|--help) usage; exit 0 ;;
+  install-tart) cmd_install_tart ${@+"$@"}; exit 0 ;;
+  doctor) cmd_doctor; exit 0 ;;
+  new) cmd_new ${@+"$@"}; exit 0 ;;
+  list|ls) cmd_list; exit 0 ;;
+  use) cmd_use ${@+"$@"}; exit 0 ;;
+  deploy) cmd_deploy ${@+"$@"}; exit 0 ;;
+esac
+
+if [ "$INSTANCE" = all ]; then
+  case "$cmd" in
+    status|start|stop|restart|provision|autostart|raft-upgrade)
+      for n in $(instance_names); do
+        echo "### $n"; "$ROOT/vm" -n "$n" "$cmd" ${@+"$@"} || true
+      done
+      exit 0 ;;
+    *) die "-n all works only with: status start stop restart provision autostart raft-upgrade" ;;
+  esac
+fi
+
+load_instance
+
+case "$cmd" in
+  init) cmd_init ;;
+  start) start_vm ;;
+  stop) stop_vm ;;
+  restart) stop_vm; start_vm ;;
+  status) cmd_status ;;
+  shell) require_running; gl 'exec bash -l' ;;
+  run) require_running; gl '"$@"' ${@+"$@"} ;;
+  provision) provision_guest "" ;;
+  destroy) cmd_destroy ${@+"$@"} ;;
+  raft-setup) cmd_raft_setup ;;
+  raft) require_running; gl 'raft-computer "$@"' ${@+"$@"} ;;
+  raft-upgrade) cmd_raft_upgrade ;;
+  raft-logs) cmd_raft_logs ${@+"$@"} ;;
+  claude-login) cmd_claude_login ;;
+  claude-key) cmd_claude_key ${@+"$@"} ;;
+  claude) require_running; gl 'claude "$@"' ${@+"$@"} ;;
+  github-login) cmd_github_login ;;
+  github-token) cmd_github_token ;;
+  gh) require_running; gl 'gh "$@"' ${@+"$@"} ;;
+  set-disk) cmd_set_disk ${@+"$@"} ;;
+  set-cpu) cmd_set_cpu ${@+"$@"} ;;
+  set-mem) cmd_set_mem ${@+"$@"} ;;
+  autostart) cmd_autostart ${@+"$@"} ;;
+  run-fg) cmd_run_fg ;;
+  *) usage; exit 1 ;;
+esac

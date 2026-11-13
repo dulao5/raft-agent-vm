@@ -1,0 +1,10 @@
+# Per Mac, not shared
+bin/
+logs/
+.state/
+.DS_Store
+*.migrated
+
+# Instance files describe one person's VMs; only the template is committed
+instances/*.env
+!instances/example.env
