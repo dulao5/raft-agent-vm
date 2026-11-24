@@ -131,6 +131,7 @@ https://github.com/login/device 授权。组织启用了 SAML SSO 的话，对�
 |---|---|
 | 看全部 / 看一套 | `./vm list` / `./vm -n <名字> status` |
 | 进入虚拟机 / 跑命令 | `./vm shell` / `./vm run <cmd...>` |
+| 复制文件进 / 出虚拟机 | `./vm cp a.txt dir/ :~/work/` / `./vm cp :~/work/out.log .`（目录递归，sha256 校验） |
 | 启动 / 停止 / 重启 | `./vm start` / `stop` / `restart` |
 | Raft 状态、体检、日志 | `./vm raft status` / `raft doctor` / `raft-logs [-f]` |
 | 升级 Raft Computer | `./vm raft-upgrade` |

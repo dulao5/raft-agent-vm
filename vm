@@ -125,6 +125,118 @@ push_file() {
   [ "$want" = "$got" ] || die "copy of $src to the guest failed (checksum mismatch)"
 }
 
+# ---- copying files (./vm cp) ------------------------------------------------
+# Upload any size: the file is split into pieces that travel as base64 arguments
+# (Linux caps one argument at 128KB, macOS a whole command line at 1MB), so each
+# `tart exec` carries 4 x 90000 bytes. The result is checked with sha256.
+upload_file() {
+  local src=$1 dst=$2 tmp c want got args=()
+  tmp="$(mktemp -d)"
+  split -b 90000 "$src" "$tmp/c."
+  "$TART" exec "$VM_NAME" bash -c ': > "$1"' _ "$dst"
+  local append='f=$1; shift; for a; do printf %s "$a" | base64 -d >> "$f"; done'
+  for c in "$tmp"/c.*; do
+    [ -e "$c" ] || continue
+    args+=("$(base64 < "$c" | tr -d '\n')")
+    if [ ${#args[@]} -eq 4 ]; then
+      "$TART" exec "$VM_NAME" bash -c "$append" _ "$dst" "${args[@]}"; args=()
+    fi
+  done
+  [ ${#args[@]} -eq 0 ] || "$TART" exec "$VM_NAME" bash -c "$append" _ "$dst" "${args[@]}"
+  rm -rf "$tmp"
+  want="$(shasum -a 256 < "$src" | cut -d" " -f1)"
+  got="$("$TART" exec "$VM_NAME" sha256sum "$dst" | cut -d" " -f1)"
+  [ "$want" = "$got" ] || die "upload of $src failed (checksum mismatch)"
+}
+
+download_file() {
+  local src=$1 dst=$2 want got
+  "$TART" exec "$VM_NAME" cat "$src" > "$dst"
+  want="$("$TART" exec "$VM_NAME" sha256sum "$src" | cut -d" " -f1)"
+  got="$(shasum -a 256 < "$dst" | cut -d" " -f1)"
+  [ "$want" = "$got" ] || { rm -f "$dst"; die "download of $src failed (checksum mismatch)"; }
+}
+
+# Guest paths: a leading ~ and relative paths are taken from the guest's $HOME.
+guest_abs() {
+  "$TART" exec "$VM_NAME" bash -c 'p=$1; case "$p" in "~") p=$HOME ;; "~/"*) p=$HOME/${p#"~/"} ;; /*) ;; *) p=$HOME/$p ;; esac; printf %s "$p"' _ "$1"
+}
+
+# ./vm cp SRC... :DEST   host -> guest (DEST defaults to the guest home)
+# ./vm cp :SRC [DEST]    guest -> host (DEST defaults to .)
+# Directories are copied recursively (as a tar archive). Like cp: if DEST is an
+# existing directory the source goes inside it, otherwise it is named DEST.
+cmd_cp() {
+  [ $# -ge 1 ] || die "usage: ./vm cp <host-path>... :<guest-path>   |   ./vm cp :<guest-path> [host-path]"
+  require_running
+  if [ "${1:0:1}" = ":" ]; then
+    [ $# -le 2 ] || die "copy one guest path at a time: ./vm cp :<guest-path> [host-path]"
+    cp_from_guest "${1:1}" "${2:-.}"
+  else
+    local dst=":" ; [ $# -ge 2 ] && dst="${!#}"
+    [ "${dst:0:1}" = ":" ] || die "the destination must be a guest path starting with ':' (e.g. :~/work/)"
+    [ $# -ge 2 ] && set -- "${@:1:$#-1}"
+    # A trailing / means "into this directory": create it if needed.
+    case "$dst" in */) "$TART" exec "$VM_NAME" mkdir -p "$(guest_abs "${dst:1}")" ;; esac
+    [ $# -eq 1 ] || "$TART" exec "$VM_NAME" test -d "$(guest_abs "${dst:1}")" \
+      || die "with several sources the destination must be an existing guest directory"
+    local s; for s in "$@"; do cp_to_guest "$s" "${dst:1}"; done
+  fi
+}
+
+cp_to_guest() {
+  local src=${1%/} dst tmp gtmp name
+  [ -n "$src" ] || src=/
+  [ -e "$src" ] || die "no such file: $1"
+  name="$(basename "$src")"
+  dst="$(guest_abs "${2:-~}")"
+  gtmp="/tmp/vm-cp.$$.$RANDOM"
+  if [ -d "$src" ]; then
+    tmp="$(mktemp -d)"
+    COPYFILE_DISABLE=1 tar --no-xattrs -C "$(dirname "$src")" -czf "$tmp/a.tgz" "$name"
+    say "copying directory $src -> $NAME:$dst ($(du -h "$tmp/a.tgz" | cut -f1) compressed)"
+    upload_file "$tmp/a.tgz" "$gtmp.tgz"; rm -rf "$tmp"
+    "$TART" exec "$VM_NAME" bash -c '
+      set -e; a=$1 n=$2 d=$3 x=$1.d
+      mkdir -p "$x"; tar -xzf "$a" -C "$x" --warning=no-unknown-keyword
+      if [ -d "$d" ]; then rm -rf "${d%/}/$n"; mv "$x/$n" "$d/"; else mkdir -p "$(dirname "$d")"; mv "$x/$n" "$d"; fi
+      rm -rf "$a" "$x"' _ "$gtmp.tgz" "$name" "$dst"
+  else
+    say "copying $src -> $NAME:$dst ($(du -h "$src" | cut -f1))"
+    upload_file "$src" "$gtmp"
+    "$TART" exec "$VM_NAME" bash -c '
+      set -e; t=$1 n=$2 d=$3 m=$4
+      if [ -d "$d" ]; then d=${d%/}/$n; else mkdir -p "$(dirname "$d")"; fi
+      mv "$t" "$d"; chmod "$m" "$d"' _ "$gtmp" "$name" "$dst" "$(/usr/bin/stat -f %Lp "$src")"
+  fi
+}
+
+cp_from_guest() {
+  local src dst=$2 name kind gtmp tmp
+  src="$(guest_abs "$1")"
+  kind="$("$TART" exec "$VM_NAME" bash -c 'if [ -d "$1" ]; then echo dir; elif [ -f "$1" ]; then echo file; else echo none; fi' _ "$src")"
+  [ "$kind" != none ] || die "no such file in the guest: $src"
+  src="${src%/}"; [ -n "$src" ] || src=/
+  name="$(basename "$src")"
+  case "$dst" in */) mkdir -p "$dst" ;; esac
+  if [ "$kind" = dir ]; then
+    gtmp="/tmp/vm-cp.$$.$RANDOM.tgz"
+    "$TART" exec "$VM_NAME" tar -C "$(dirname "$src")" -czf "$gtmp" "$name"
+    tmp="$(mktemp -d)"
+    say "copying directory $NAME:$src -> $dst"
+    download_file "$gtmp" "$tmp/a.tgz"
+    "$TART" exec "$VM_NAME" rm -f "$gtmp"
+    mkdir -p "$tmp/x"; tar -xzf "$tmp/a.tgz" -C "$tmp/x"
+    if [ -d "$dst" ]; then rm -rf "${dst%/}/$name"; mv "$tmp/x/$name" "$dst/"
+    else mkdir -p "$(dirname "$dst")"; mv "$tmp/x/$name" "$dst"; fi
+    rm -rf "$tmp"
+  else
+    [ -d "$dst" ] && dst="${dst%/}/$name"
+    say "copying $NAME:$src -> $dst"
+    download_file "$src" "$dst"
+  fi
+}
+
 wait_ready() {
   say "waiting for the guest agent"
   local i
@@ -584,7 +696,9 @@ Lifecycle (one instance)
   init                 create the VM, set cpu/mem/disk, provision
   start | stop | restart
   status               VM, resources, Raft Computer, Claude and GitHub state
-  shell                login shell in the guest (also: ./vm run <command...>)
+  shell                interactive login shell in the guest (also: ./vm run <command...>)
+  cp SRC... :DEST      copy files/directories into the guest (:~/x, relative = guest home)
+  cp :SRC [DEST]       copy a file/directory out of the guest (DEST defaults to .)
   provision            re-run guest provisioning (safe to repeat)
   destroy [--purge]    delete the VM and its disk (--purge: and its instance file)
 
@@ -655,6 +769,7 @@ case "$cmd" in
   status) cmd_status ;;
   shell) require_running; gl 'exec bash -l' ;;
   run) require_running; gl '"$@"' ${@+"$@"} ;;
+  cp) cmd_cp ${@+"$@"} ;;
   provision) provision_guest "" ;;
   destroy) cmd_destroy ${@+"$@"} ;;
   raft-setup) cmd_raft_setup ;;
