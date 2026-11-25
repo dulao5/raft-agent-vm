@@ -61,6 +61,8 @@ export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
 # tart exec sessions start with a 1024 soft limit; raise it to the hard limit.
 ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$HOME/.tiup/bin:$PATH"
+# The guest has a D-Bus session bus but no Secret Service, so keep agy's login in a file.
+export AGY_CLI_FORCE_FILE_TOKEN_STORAGE=1
 if [ -f "$HOME/.config/raft-vm/env" ]; then set -a; . "$HOME/.config/raft-vm/env"; set +a; fi
 # <<< raft-vm <<<
 PROFILE
@@ -68,6 +70,9 @@ export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$HOME/.tiup/bin:$PATH"
 
 echo "==> Claude Code"
 if ! command -v claude >/dev/null; then curl -fsSL https://claude.ai/install.sh | bash; fi
+
+echo "==> Antigravity CLI (agy)"
+if ! command -v agy >/dev/null; then curl -fsSL https://antigravity.google/cli/install.sh | bash; fi
 
 echo "==> Raft Computer"
 if ! command -v raft-computer >/dev/null; then curl -fsSL https://cdn.raft.build/computer/install.sh | sh; fi
@@ -88,4 +93,4 @@ install -m 644 "$UNIT_SRC" "$HOME/.config/systemd/user/raft-computer.service"
 export XDG_RUNTIME_DIR="/run/user/$(id -u)"
 systemctl --user daemon-reload
 
-echo "==> provisioned: $(claude --version 2>/dev/null | head -1), raft-computer $(raft-computer --version 2>/dev/null), $(rustc --version 2>/dev/null), tiup $(tiup --version 2>/dev/null | head -1)"
+echo "==> provisioned: $(claude --version 2>/dev/null | head -1), agy $(agy --version 2>/dev/null | head -1), raft-computer $(raft-computer --version 2>/dev/null), $(rustc --version 2>/dev/null), tiup $(tiup --version 2>/dev/null | head -1)"

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Run Linux VMs under Tart that host Raft Computer, Claude Code and the GitHub CLI.
+# Run Linux VMs under Tart that host Raft Computer, Claude Code, Antigravity CLI and the GitHub CLI.
 # One Mac can run several independent instances. See README.md or `./vm help`.
 set -euo pipefail
 
@@ -420,6 +420,7 @@ Deployed. On $target, in ~/$dir:
   ./vm -n <name> init        # clone, configure, provision (about 10 minutes)
   ./vm -n <name> raft-setup  # each VM is its own Raft computer: approve it in the browser
   ./vm -n <name> claude-login
+  ./vm -n <name> agy auth
   ./vm -n <name> github-login
   ./vm -n <name> autostart on
 EOF
@@ -454,6 +455,7 @@ cmd_init() {
 VM '$NAME' is ready. Next, authenticate (details in README.md):
   ./vm -n $NAME raft-setup      # approve this computer in your browser, then it starts
   ./vm -n $NAME claude-login    # or: ./vm -n $NAME claude-key
+  ./vm -n $NAME agy auth        # Antigravity CLI (optional)
   ./vm -n $NAME github-login
   ./vm -n $NAME autostart on    # start the VM when you log in
 EOF
@@ -473,6 +475,12 @@ cmd_status() {
   gl 'systemctl --user is-enabled raft-computer 2>&1 | sed "s/^/unit enabled: /"; systemctl --user is-active raft-computer 2>&1 | sed "s/^/unit active:  /"; raft-computer status 2>&1 | sed -n "2,12p"' || true
   echo "--- claude"
   gl 'claude auth status 2>&1 | head -8; [ -s ~/.config/raft-vm/env ] && echo "env file keys: $(cut -d= -f1 ~/.config/raft-vm/env | tr "\n" " ")"' || true
+  echo "--- antigravity"
+  # No tty, so an unsigned agy reports it instead of starting a sign-in flow.
+  tmo 30 "$TART" exec "$VM_NAME" bash -lc 'command -v agy >/dev/null || { echo "agy not installed; run ./vm provision"; exit 0; }
+    echo "agy $(agy --version 2>/dev/null)"
+    if out="$(agy models </dev/null 2>&1)"; then echo "signed in ($(printf "%s\n" "$out" | grep -vc "^Fetching") models available)"
+    else printf "%s\n" "$out" | grep -v "^Fetching" | head -2; fi' || true
   echo "--- github"
   gl 'gh auth status 2>&1 | head -6' || true
 }
@@ -532,6 +540,30 @@ cmd_claude_key() {
   stored="$("$TART" exec "$VM_NAME" bash -c 'grep "^$1=" "$HOME/.config/raft-vm/env" | cut -d= -f2- | tr -d "\n" | wc -c' _ "$name" | tr -d " ")"
   [ "$stored" = "$(( ${#val} + 2 ))" ] || die "storing $name failed (length mismatch); run ./vm claude-key clear and retry"
   say "stored $name in the guest (~/.config/raft-vm/env, mode 600)"
+  gl 'systemctl --user is-enabled raft-computer >/dev/null 2>&1 && systemctl --user restart raft-computer || true'
+}
+
+# Antigravity CLI has no auth subcommand: the first interactive run signs in.
+# The token is kept in a file on the guest disk (AGY_CLI_FORCE_FILE_TOKEN_STORAGE,
+# set in ~/.profile and the raft-computer unit), so it survives reboots.
+cmd_agy() {
+  require_running
+  gl 'command -v agy >/dev/null' || die "agy is not installed in the guest; run ./vm -n $NAME provision"
+  if [ "${1:-}" != "auth" ]; then gl 'agy "$@"' ${@+"$@"}; return; fi
+  [ -t 0 ] && [ -t 1 ] || die "./vm agy auth needs an interactive terminal"
+  cat <<'EOF'
+==> starting Antigravity CLI sign-in:
+    1. choose "Google OAuth" (or "Use a Google Cloud project")
+    2. open the printed URL in your browser, approve, paste the code back here
+    3. once the prompt box appears you are signed in; press Ctrl+C twice to exit
+EOF
+  gl 'agy' || true
+  if tmo 30 "$TART" exec "$VM_NAME" bash -lc 'agy models </dev/null >/dev/null 2>&1'; then
+    say "Antigravity CLI is signed in (token stored in the guest)"
+  else
+    die "Antigravity CLI is not signed in; run ./vm -n $NAME agy auth again"
+  fi
+  say "restarting Raft Computer so agents see the new login"
   gl 'systemctl --user is-enabled raft-computer >/dev/null 2>&1 && systemctl --user restart raft-computer || true'
 }
 
@@ -695,7 +727,7 @@ Setup
 Lifecycle (one instance)
   init                 create the VM, set cpu/mem/disk, provision
   start | stop | restart
-  status               VM, resources, Raft Computer, Claude and GitHub state
+  status               VM, resources, Raft Computer, Claude, Antigravity and GitHub state
   shell                interactive login shell in the guest (also: ./vm run <command...>)
   cp SRC... :DEST      copy files/directories into the guest (:~/x, relative = guest home)
   cp :SRC [DEST]       copy a file/directory out of the guest (DEST defaults to .)
@@ -712,6 +744,10 @@ Claude Code
   claude-login         sign in with a Claude account (browser URL + pasted code)
   claude-key [clear]   store ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN in the guest
   claude <args...>     run claude in the guest
+
+Antigravity CLI
+  agy auth             sign in (Google account: browser URL + pasted code); kept in the guest
+  agy <args...>        run agy in the guest (e.g. agy -p "say hi", agy update)
 
 GitHub
   github-login         sign in with a device code (browser), set up git credentials
@@ -779,6 +815,7 @@ case "$cmd" in
   claude-login) cmd_claude_login ;;
   claude-key) cmd_claude_key ${@+"$@"} ;;
   claude) require_running; gl 'claude "$@"' ${@+"$@"} ;;
+  agy) cmd_agy ${@+"$@"} ;;
   github-login) cmd_github_login ;;
   github-token) cmd_github_token ;;
   gh) require_running; gl 'gh "$@"' ${@+"$@"} ;;

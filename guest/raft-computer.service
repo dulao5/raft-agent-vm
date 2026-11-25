@@ -5,6 +5,8 @@ StartLimitIntervalSec=0
 [Service]
 Type=simple
 Environment=PATH=%h/.local/bin:%h/.cargo/bin:%h/.tiup/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# Antigravity CLI keeps its login in a file (the guest has no Secret Service).
+Environment=AGY_CLI_FORCE_FILE_TOKEN_STORAGE=1
 # Optional Claude credentials written by `./vm claude-key`.
 EnvironmentFile=-%h/.config/raft-vm/env
 ExecStart=%h/.local/bin/raft-computer start --foreground

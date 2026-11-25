@@ -1,7 +1,7 @@
 # Tart agent VMs
 
 在 Apple Silicon 的 Mac 上用 [Tart](https://tart.run) 跑 Ubuntu 虚拟机，常驻运行
-**Raft Computer**、**Claude Code**（`claude -p`）和 **GitHub CLI**，并带 Rust 与 TiUP 工具链。
+**Raft Computer**、**Claude Code**（`claude -p`）、**Antigravity CLI**（`agy -p`）和 **GitHub CLI**，并带 Rust 与 TiUP 工具链。
 **一台 Mac 可以同时装多套互相独立的虚拟机。** 所有操作通过一个脚本 `./vm` 完成。
 
 - 隔离：每套是独立的 Linux 虚拟机（Virtualization.framework），不是共享内核的容器。
@@ -12,7 +12,7 @@
 
 - Apple Silicon，macOS 13 或更新（在 macOS 26 上开发和测试）。
 - 要自动启动的话，该用户需要登录在 Mac 的桌面上。
-- 能访问 GitHub（下载 Tart 和镜像）、`cdn.raft.build`、`claude.ai`。
+- 能访问 GitHub（下载 Tart 和镜像）、`cdn.raft.build`、`claude.ai`、`antigravity.google`。
 
 ## 快速开始
 
@@ -29,6 +29,7 @@ git clone <this-repo> ~/tart-vm && cd ~/tart-vm
 ```bash
 ./vm -n dev raft-setup      # Raft：device code
 ./vm -n dev claude-login    # Claude：打开网址，把 code 粘贴回来
+./vm -n dev agy auth        # Antigravity CLI（可选）：打开网址，把 code 粘贴回来
 ./vm -n dev github-login    # GitHub：device code
 ./vm -n dev autostart on    # 登录 macOS 后自动启动
 ./vm -n dev status          # 检查
@@ -58,7 +59,7 @@ VM=build ./vm shell           # 也可以用环境变量选择
 | 虚拟机与磁盘 | Tart 虚拟机名默认等于实例名，数据在 `~/.tart/vms/<名字>` |
 | 主机名 | 新克隆的客户机主机名设为实例名 |
 | Raft | 各自配对，在 Raft 里显示为 `<这台 Mac 的名字>-<实例名>` |
-| Claude / GitHub | 各自登录，互不共享凭据 |
+| Claude / Antigravity / GitHub | 各自登录，互不共享凭据 |
 | 开机自启 | launchd 任务 `com.tartvm.<名字>` |
 | 日志 | `logs/<名字>.log` |
 
@@ -69,7 +70,7 @@ Apple 对 macOS 客户机限制同时 2 台，这里只用 Linux 客户机，已
 
 ## 认证
 
-三项都在客户机里保存凭据，重启后保留。命令会在需要时打开终端交互，
+各项都在客户机里保存凭据，重启后保留。命令会在需要时打开终端交互，
 `./vm` 检测到终端会自动接上，不需要 SSH。
 
 **Raft**：`./vm -n <名字> raft-setup`
@@ -82,6 +83,15 @@ Apple 对 macOS 客户机限制同时 2 台，这里只用 Linux 客户机，已
 也可以用 `claude-key` 保存 `ANTHROPIC_API_KEY`（按 API 计费，优先于账号登录）
 或 `claude setup-token` 生成的 `CLAUDE_CODE_OAUTH_TOKEN`，写入客户机 `~/.config/raft-vm/env`（权限 600）。
 验证：`./vm claude -p "say hi"`。
+
+**Antigravity CLI**：`./vm -n <名字> agy auth`
+`agy` 没有单独的登录子命令，这条命令会启动交互式 `agy`：选 “Google OAuth”（或 “Use a Google Cloud project”），
+在浏览器打开打印的网址并授权，把 code 粘贴回终端。出现输入框即已登录，按两次 Ctrl+C 退出。
+命令随后确认登录成功，并重启 Raft Computer 让其中的 agent 用上新登录。
+客户机有 D-Bus 会话总线但没有 Secret Service（钥匙串），所以 `~/.profile` 和 `raft-computer` 服务都设置了
+`AGY_CLI_FORCE_FILE_TOKEN_STORAGE=1`，令牌以文件形式保存在客户机磁盘上，重启后保留。
+验证：`./vm agy -p "say hi"` 或 `./vm status`。退出登录：在 `./vm agy` 里输入 `/logout`。
+已有的虚拟机先运行一次 `./vm provision` 来安装 `agy` 并更新环境。
 
 **GitHub**：`./vm -n <名字> github-login`
 先按回车接受 `Authenticate Git with your GitHub credentials? (Y/n)`，再把打印的 code 填到
@@ -136,6 +146,7 @@ https://github.com/login/device 授权。组织启用了 SAML SSO 的话，对�
 | Raft 状态、体检、日志 | `./vm raft status` / `raft doctor` / `raft-logs [-f]` |
 | 升级 Raft Computer | `./vm raft-upgrade` |
 | 升级 Claude Code | `./vm claude update` |
+| 升级 Antigravity CLI | `./vm agy update`（平时也会在后台自动更新） |
 | 重新安装依赖 | `./vm provision`（幂等，可重复） |
 | 升级 Tart | `./vm install-tart --force` |
 | 删除一套 | `./vm -n <名字> destroy --purge` |
@@ -143,7 +154,7 @@ https://github.com/login/device 授权。组织启用了 SAML SSO 的话，对�
 `destroy` 要求输入实例名确认，`--purge` 同时删除 `instances/<名字>.env`。
 
 Raft Computer 以 systemd 用户服务 `raft-computer` 运行（`raft-computer start --foreground`），
-`Restart=always`，PATH 包含 `~/.local/bin`、`~/.cargo/bin`、`~/.tiup/bin`。
+`Restart=always`，PATH 包含 `~/.local/bin`、`~/.cargo/bin`、`~/.tiup/bin`，并设置 `AGY_CLI_FORCE_FILE_TOKEN_STORAGE=1`。
 
 ## 目录结构
 
@@ -166,7 +177,7 @@ Raft Computer 以 systemd 用户服务 `raft-computer` 运行（`raft-computer s
 
 ## 已知限制
 
-- 三项浏览器授权需要你亲自完成，脚本无法代劳。
+- 各项浏览器授权需要你亲自完成，脚本无法代劳。
 - `tart stop` 是强制断电，所以脚本一律先在客户机里 `poweroff`；不要直接用 `tart stop`。
 - 强杀 Tart 进程或断电时，最近约 40 秒内写入的文件可能变成 0 字节（ext4 延迟分配），已用 `sync=fsync` 缩小窗口。需要停机一律用 `./vm stop`。
 - 客户机内存不会还给 macOS，直到虚拟机关机。
